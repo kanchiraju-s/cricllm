@@ -6,14 +6,16 @@ Run:
     python app.py
 Then open http://localhost:5000
 
-One JSON route (POST /api/ask) doing the same retrieval + generation as the
-CLI script — both go through cricllm.qa.QAEngine so there's no duplicate
-logic to keep in sync. The page itself is just plain HTML/CSS/JS, no
-framework, no build step, nothing to install beyond Flask.
+POST /api/ask streams the answer back as Server-Sent Events instead of
+waiting for the whole thing and sending one JSON blob — same retrieval +
+generation as the CLI script, both going through cricllm.qa.QAEngine so
+there's no duplicate logic to keep in sync. The page itself is just plain
+HTML/CSS/JS, no framework, no build step, nothing to install beyond Flask.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -21,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import bleach  # noqa: E402
 import markdown as markdown_lib  # noqa: E402
-from flask import Flask, jsonify, render_template, request  # noqa: E402
+from flask import Flask, Response, jsonify, render_template, request  # noqa: E402
 
 from cricllm.config import load_settings  # noqa: E402
 from cricllm.exceptions import CricLLMError  # noqa: E402
@@ -58,6 +60,10 @@ def index() -> str:
     return render_template("index.html")
 
 
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 @app.post("/api/ask")
 def ask():
     payload = request.get_json(silent=True) or {}
@@ -77,20 +83,26 @@ def ask():
             }
         ), 503
 
-    try:
-        result = _engine.answer(question, top_k=top_k)
-    except CricLLMError as exc:
-        logger.error("Failed to answer %r: %s", question, exc)
-        return jsonify({"error": str(exc)}), 502
+    def stream():
+        try:
+            for event in _engine.answer_stream(question, top_k=top_k):
+                if event.kind == "sources":
+                    sources = [
+                        {"header_path": s.header_path, "distance": s.distance}
+                        for s in event.sources
+                    ]
+                    yield _sse({"type": "sources", "sources": sources})
+                elif event.kind == "delta":
+                    yield _sse({"type": "answer", "answer_html": render_answer_html(event.text)})
+            yield _sse({"type": "done"})
+        except CricLLMError as exc:
+            logger.error("Failed to answer %r: %s", question, exc)
+            yield _sse({"type": "error", "error": str(exc)})
 
-    return jsonify(
-        {
-            "answer": result.answer,
-            "answer_html": render_answer_html(result.answer),
-            "sources": [
-                {"header_path": s.header_path, "distance": s.distance} for s in result.sources
-            ],
-        }
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

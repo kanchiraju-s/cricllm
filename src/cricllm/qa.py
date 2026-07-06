@@ -7,7 +7,9 @@ retrieval logic would inevitably drift apart between the two.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import Literal
 
 from google import genai
 
@@ -140,11 +142,19 @@ class Source:
 
 
 @dataclass
-class AnswerResult:
-    """What we send back: the answer, plus whatever it was grounded in."""
+class StreamEvent:
+    """One step of a streaming answer.
 
-    answer: str
+    ``kind="sources"`` fires once, right after retrieval, before we've asked
+    Gemini anything. ``kind="delta"`` fires repeatedly as the answer comes
+    in — ``text`` is the *full* answer so far each time, not just the new
+    bit, since re-rendering the whole accumulated Markdown is what the web
+    UI needs anyway.
+    """
+
+    kind: Literal["sources", "delta"]
     sources: list[Source] = field(default_factory=list)
+    text: str = ""
 
 
 class QAEngine:
@@ -174,31 +184,48 @@ class QAEngine:
     def chunk_count(self) -> int:
         return self._store.count()
 
-    def answer(self, question: str, top_k: int | None = None) -> AnswerResult:
-        """The whole flow: embed the question, pull matching Law excerpts, ask Gemini."""
+    def _retrieve(self, question: str, top_k: int | None) -> tuple[list[Source], str]:
+        """Embed the question and pull back matching Law excerpts, built into a prompt-ready context."""
         resolved_top_k = top_k or self._settings.retrieval_top_k
         query_vector = self._query_embedder.embed_query(question)
         matches = self._store.query(query_vector, n_results=resolved_top_k)
 
-        if not matches:
-            return AnswerResult(answer="No relevant chunks found.", sources=[])
-
-        context_blocks = []
         sources = []
+        context_blocks = []
         for match in matches:
             header_path = match["metadata"].get("header_path", "unknown section")
             context_blocks.append(f"### {header_path}\n{match['content']}")
             sources.append(
                 Source(header_path=header_path, distance=match["distance"], content=match["content"])
             )
-        context = "\n\n---\n\n".join(context_blocks)
+        return sources, "\n\n---\n\n".join(context_blocks)
+
+    def answer_stream(self, question: str, top_k: int | None = None) -> Iterator[StreamEvent]:
+        """Same flow as before, but yields the answer as it's generated instead of all at once.
+
+        Yields one ``StreamEvent(kind="sources", ...)`` right after retrieval,
+        then a growing series of ``StreamEvent(kind="delta", text=...)`` as
+        Gemini streams its response — each one carries the *full* answer so
+        far, so a consumer can just re-render/replace on every event.
+        """
+        sources, context = self._retrieve(question, top_k)
+        yield StreamEvent(kind="sources", sources=sources)
+
+        if not sources:
+            yield StreamEvent(kind="delta", text="No relevant chunks found.")
+            return
 
         prompt = f"{SYSTEM_PROMPT}\n\n# Documentation excerpts\n\n{context}\n\n# Question\n{question}"
-        response = self._client.models.generate_content(
-            model=self._settings.generation_model, contents=prompt
-        )
-        # response.text can come back None (safety filter, empty candidates,
-        # whatever) — don't let that show up as the literal string "None".
-        answer = response.text or "The model returned no answer for this question."
 
-        return AnswerResult(answer=answer, sources=sources)
+        accumulated = ""
+        for chunk in self._client.models.generate_content_stream(
+            model=self._settings.generation_model, contents=prompt
+        ):
+            if chunk.text:
+                accumulated += chunk.text
+                yield StreamEvent(kind="delta", text=accumulated)
+
+        if not accumulated:
+            # Safety-filtered, empty candidates, whatever — don't leave the
+            # caller with nothing at all.
+            yield StreamEvent(kind="delta", text="The model returned no answer for this question.")

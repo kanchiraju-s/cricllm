@@ -40,14 +40,24 @@ def main(argv: list[str] | None = None) -> int:
         print("  python scripts/run_ingestion.py --input data/icc_rulebook.md")
         return 1
 
-    result = engine.answer(args.question, top_k=args.top_k)
+    sources = []
+    printed_so_far = 0
+    for event in engine.answer_stream(args.question, top_k=args.top_k):
+        if event.kind == "sources":
+            sources = event.sources
+        elif event.kind == "delta":
+            # Each event carries the full answer so far — print only the
+            # part we haven't shown yet, so the terminal streams like a
+            # normal chat response instead of reprinting everything.
+            print(event.text[printed_so_far:], end="", flush=True)
+            printed_so_far = len(event.text)
+    print()
 
-    print(result.answer)
-    if not result.sources:
+    if not sources:
         return 1
 
     print("\n--- Sources ---")
-    for source in result.sources:
+    for source in sources:
         print(f"  ({source.distance:.3f}) {source.header_path}")
 
     return 0

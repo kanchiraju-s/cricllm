@@ -125,11 +125,15 @@ pip install flask
 python app.py
 ```
 
-Then open **http://localhost:5000** — type a question, hit ask, get an answer
-with cited Laws and retrieval sources. It's a single Flask route
-(`POST /api/ask`) wrapping the exact same retrieval + generation logic as
-`scripts/ask.py`, plus one static HTML page (`templates/index.html`) with
-vanilla JS — no build step, no framework.
+Then open **http://localhost:5000** — type a question, hit ask, and watch the
+answer stream in as it's generated, with cited Laws and retrieval sources
+underneath. `POST /api/ask` streams Server-Sent Events instead of waiting
+for the whole answer before responding — same retrieval + generation logic
+as `scripts/ask.py` (both go through `cricllm.qa.QAEngine`), plus one static
+HTML page (`templates/index.html`) with vanilla JS — no build step, no
+framework. Streaming also matters if you deploy this behind gunicorn: a
+sync worker's timeout resets on every chunk sent, so a slow generation
+doesn't silently sit there until the whole request gets killed.
 
 ## ⚙️ Configuration
 

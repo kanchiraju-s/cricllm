@@ -196,24 +196,62 @@ async function askQuestion() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question }),
     });
-    const data = await res.json();
 
     if (!res.ok) {
+      // Non-streaming error responses (empty question, empty vector store)
+      // still come back as plain JSON with an error status.
+      const data = await res.json().catch(() => ({}));
       answerCard.style.display = 'none';
       errorBox.textContent = data.error || 'Something went wrong.';
       errorBox.style.display = 'block';
       return;
     }
 
-    answerBox.innerHTML = data.answer_html;
+    let gotAnyAnswer = false;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
 
-    if (data.sources && data.sources.length) {
-      sourcesBox.innerHTML = '<strong>Sources:</strong>';
-      for (const s of data.sources) {
-        const row = document.createElement('div');
-        row.innerHTML = `<span class="badge">${s.distance.toFixed(3)}</span>${s.header_path}`;
-        sourcesBox.appendChild(row);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE messages are separated by a blank line; keep whatever's left
+      // over (an incomplete message) in the buffer for the next chunk.
+      let boundary;
+      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+        const rawMessage = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+
+        const dataLine = rawMessage.split('\n').find((line) => line.startsWith('data: '));
+        if (!dataLine) continue;
+        const event = JSON.parse(dataLine.slice(6));
+
+        if (event.type === 'sources') {
+          if (event.sources && event.sources.length) {
+            sourcesBox.innerHTML = '<strong>Sources:</strong>';
+            for (const s of event.sources) {
+              const row = document.createElement('div');
+              row.innerHTML = `<span class="badge">${s.distance.toFixed(3)}</span>${s.header_path}`;
+              sourcesBox.appendChild(row);
+            }
+          }
+        } else if (event.type === 'answer') {
+          gotAnyAnswer = true;
+          answerBox.innerHTML = event.answer_html;
+        } else if (event.type === 'error') {
+          answerCard.style.display = 'none';
+          errorBox.textContent = event.error;
+          errorBox.style.display = 'block';
+        }
       }
+    }
+
+    if (!gotAnyAnswer) {
+      answerCard.style.display = 'none';
+      errorBox.textContent = 'The server closed the connection without sending an answer.';
+      errorBox.style.display = 'block';
     }
   } catch (err) {
     answerCard.style.display = 'none';

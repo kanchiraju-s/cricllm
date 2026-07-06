@@ -3,7 +3,6 @@
 venv/
 __pycache__/
 *.pyc
-.chroma/
 .cache/
 logs/
 *.egg-info/

@@ -52,15 +52,20 @@ vector store is empty — run ingestion first. Prints the answer, then a
 retrieved text when debugging why an answer looks wrong).
 
 ### `app.py`
-Browser front-end: a small Flask server exposing `POST /api/ask`, which runs
-the exact same retrieval + generation logic as `scripts/ask.py`, plus a
-`GET /` route serving `templates/index.html` (vanilla HTML/CSS/JS, no
-framework, no build step).
+Browser front-end: a small Flask server exposing `POST /api/ask`, which
+streams the answer back as Server-Sent Events (not one big JSON blob) —
+same retrieval + generation logic as `scripts/ask.py`, both going through
+`cricllm.qa.QAEngine.answer_stream()`. Plus a `GET /` route serving
+`templates/index.html` (vanilla HTML/CSS/JS, no framework, no build step).
 ```bash
 pip install flask
 python app.py
 # open http://localhost:5000
 ```
+If you deploy this behind gunicorn, streaming isn't just nicer UX — a sync
+worker's timeout clock resets every time a chunk is sent, so a slow
+generation (retries, a long answer) doesn't just sit silent until the whole
+request gets killed by `WORKER TIMEOUT`.
 
 ---
 
@@ -83,13 +88,14 @@ python app.py
 | `models.py` | `IngestionStats` — per-file result summary (chunks ingested/duplicate/skipped, errors). | Adding a new stat to track/report. |
 | `pipeline.py` | `IngestionPipeline.ingest_file()` — orchestrates one file end-to-end: file-hash check → load → chunk → dedupe → filter-already-ingested → embed → upsert → mark completed. Writes failed batches to `logs/dead_letter/*.json` instead of losing progress. | Changing the overall ingestion flow/ordering. |
 | `cli.py` | `cricllm.cli.main()` — argparse entry point behind `run_ingestion.py`. Walks a file or directory of `.md` files and calls `ingest_file()` on each. | Adding a new CLI flag. |
+| `qa.py` | `QAEngine` — the actual "answer a question" logic, shared by `scripts/ask.py` and `app.py` so neither has its own copy of the system prompt or retrieval flow. `answer_stream()` yields `StreamEvent`s: one `kind="sources"` right after retrieval, then a growing series of `kind="delta"` as Gemini streams the answer (each one is the *full* text so far, not just the new bit). | Changing the system prompt, or how retrieval feeds into the generation prompt. |
 | `__init__.py` | Just `__version__`. | Bumping version. |
 
 ### Project root
 
 | File | Purpose |
 |---|---|
-| `app.py` | Flask web UI — `POST /api/ask` (retrieval + generation, JSON in/out) and `GET /` (serves `templates/index.html`). Not part of the `cricllm` package; it's a thin consumer of it, same as `scripts/ask.py`. |
+| `app.py` | Flask web UI — `POST /api/ask` (streams the answer as Server-Sent Events) and `GET /` (serves `templates/index.html`). Not part of the `cricllm` package; it's a thin consumer of it, same as `scripts/ask.py`. |
 | `pdf_md.py` | One-off utility: converts the official ICC Laws PDF (`ilovepdf_merged.pdf`) into `data/icc_rulebook.md` via `docling`. Not part of the ingestion pipeline itself. |
 
 ---
