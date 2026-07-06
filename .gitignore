@@ -1,0 +1,20 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.chroma/
+.cache/
+logs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+.DS_Store
+
+# Copyrighted rulebook source data — not ours to redistribute publicly.
+# Supply your own copy locally; see data/README.md.
+data/icc_rulebook.md
+ilovepdf_merged.pdf

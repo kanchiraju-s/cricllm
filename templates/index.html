@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🏏 CricLLM — Ask the Laws of Cricket</title>
+<style>
+  :root {
+    --pitch-green: #1e5631;
+    --pitch-green-dark: #123d21;
+    --pitch-light: #e9f5ec;
+    --stump-brown: #8a5a2b;
+    --text: #1a1a1a;
+    --muted: #5a6b62;
+    --card-bg: #ffffff;
+    --border: #d4e3d8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--pitch-light);
+    color: var(--text);
+  }
+  header {
+    background: linear-gradient(135deg, var(--pitch-green), var(--pitch-green-dark));
+    color: white;
+    padding: 2rem 1.5rem;
+    text-align: center;
+  }
+  header h1 { margin: 0 0 0.25rem; font-size: 1.8rem; }
+  header p { margin: 0; opacity: 0.85; font-size: 0.95rem; }
+  main {
+    max-width: 720px;
+    margin: -1.5rem auto 2rem;
+    padding: 0 1.5rem;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+    margin-bottom: 1.25rem;
+  }
+  textarea {
+    width: 100%;
+    min-height: 90px;
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 1rem;
+    font-family: inherit;
+    resize: vertical;
+  }
+  button {
+    margin-top: 0.75rem;
+    background: var(--pitch-green);
+    color: white;
+    border: none;
+    padding: 0.65rem 1.4rem;
+    border-radius: 8px;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--pitch-green-dark); }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  .examples { font-size: 0.85rem; color: var(--muted); margin-top: 0.6rem; }
+  .examples button {
+    background: none;
+    color: var(--pitch-green-dark);
+    border: 1px solid var(--border);
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+    margin: 0.2rem 0.3rem 0 0;
+    border-radius: 6px;
+  }
+  .examples button:hover { background: var(--pitch-light); }
+  #answer-card { display: none; }
+  #answer {
+    line-height: 1.6;
+    font-size: 0.98rem;
+  }
+  #answer h1, #answer h2, #answer h3 {
+    color: var(--pitch-green-dark);
+    margin: 1rem 0 0.4rem;
+  }
+  #answer h1:first-child, #answer h2:first-child, #answer h3:first-child { margin-top: 0; }
+  #answer p { margin: 0 0 0.75rem; }
+  #answer ul, #answer ol { margin: 0 0 0.75rem; padding-left: 1.4rem; }
+  #answer li { margin: 0.2rem 0; }
+  #answer code {
+    background: var(--pitch-light);
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  #answer pre {
+    background: var(--pitch-light);
+    padding: 0.75rem;
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+  #answer blockquote {
+    border-left: 3px solid var(--border);
+    margin: 0 0 0.75rem;
+    padding: 0.1rem 0 0.1rem 0.9rem;
+    color: var(--muted);
+  }
+  #sources {
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--border);
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  #sources div { margin: 0.15rem 0; }
+  .badge {
+    display: inline-block;
+    background: var(--pitch-light);
+    color: var(--pitch-green-dark);
+    border-radius: 6px;
+    padding: 0.05rem 0.4rem;
+    font-family: monospace;
+    margin-right: 0.4rem;
+  }
+  #error {
+    display: none;
+    color: #8a1f1f;
+    background: #fdecec;
+    border: 1px solid #f3bcbc;
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    margin-bottom: 1.25rem;
+  }
+  .loading { color: var(--muted); font-style: italic; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🏏 CricLLM</h1>
+  <p>Ask a question about the ICC Laws of Cricket — answers grounded strictly in the rulebook 📖</p>
+</header>
+
+<main>
+  <div class="card">
+    <textarea id="question" placeholder="e.g. What happens if a fielder deliberately deflects the ball with their helmet?"></textarea>
+    <div>
+      <button id="ask-btn" onclick="askQuestion()">🏏 Ask</button>
+    </div>
+    <div class="examples">
+      Try:
+      <button onclick="fillExample(this)">How many no-balls make an over invalid?</button>
+      <button onclick="fillExample(this)">When is a ball considered dead?</button>
+      <button onclick="fillExample(this)">What is the penalty for a deliberate short run?</button>
+    </div>
+  </div>
+
+  <div id="error"></div>
+
+  <div class="card" id="answer-card">
+    <div id="answer"></div>
+    <div id="sources"></div>
+  </div>
+</main>
+
+<script>
+function fillExample(btn) {
+  document.getElementById('question').value = btn.textContent;
+}
+
+async function askQuestion() {
+  const question = document.getElementById('question').value.trim();
+  const askBtn = document.getElementById('ask-btn');
+  const errorBox = document.getElementById('error');
+  const answerCard = document.getElementById('answer-card');
+  const answerBox = document.getElementById('answer');
+  const sourcesBox = document.getElementById('sources');
+
+  errorBox.style.display = 'none';
+  if (!question) {
+    errorBox.textContent = 'Type a question first.';
+    errorBox.style.display = 'block';
+    return;
+  }
+
+  askBtn.disabled = true;
+  answerCard.style.display = 'block';
+  answerBox.innerHTML = '<span class="loading">🏏 Bowling a question at the rulebook…</span>';
+  sourcesBox.innerHTML = '';
+
+  try {
+    const res = await fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      answerCard.style.display = 'none';
+      errorBox.textContent = data.error || 'Something went wrong.';
+      errorBox.style.display = 'block';
+      return;
+    }
+
+    answerBox.innerHTML = data.answer_html;
+
+    if (data.sources && data.sources.length) {
+      sourcesBox.innerHTML = '<strong>Sources:</strong>';
+      for (const s of data.sources) {
+        const row = document.createElement('div');
+        row.innerHTML = `<span class="badge">${s.distance.toFixed(3)}</span>${s.header_path}`;
+        sourcesBox.appendChild(row);
+      }
+    }
+  } catch (err) {
+    answerCard.style.display = 'none';
+    errorBox.textContent = 'Could not reach the server: ' + err;
+    errorBox.style.display = 'block';
+  } finally {
+    askBtn.disabled = false;
+  }
+}
+
+document.getElementById('question').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    askQuestion();
+  }
+});
+</script>
+
+</body>
+</html>
