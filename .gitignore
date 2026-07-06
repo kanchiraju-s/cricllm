@@ -17,3 +17,8 @@ build/
 data/icc_rulebook.md
 ilovepdf_merged.pdf
 hello.py
+
+# Old local chromadb store — no longer used (moved to hosted Pinecone), and
+# it held the actual rulebook text, which shouldn't have been in a public
+# repo in the first place. Left ignored here as a guardrail.
+.chroma/

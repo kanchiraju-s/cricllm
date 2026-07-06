@@ -62,10 +62,12 @@ pip install flask
 python app.py
 # open http://localhost:5000
 ```
-If you deploy this behind gunicorn, streaming isn't just nicer UX — a sync
+If you deploy this behind gunicorn, streaming isn't just nicer UX — a
 worker's timeout clock resets every time a chunk is sent, so a slow
 generation (retries, a long answer) doesn't just sit silent until the whole
-request gets killed by `WORKER TIMEOUT`.
+request gets killed by `WORKER TIMEOUT`. (This alone didn't fix the real
+production incident we hit — see "chromadb hangs inside a live gunicorn
+worker" below.)
 
 ---
 
@@ -84,7 +86,7 @@ request gets killed by `WORKER TIMEOUT`.
 | `semantic_chunker.py` | The core chunking algorithm: header split → atomic/prose segmentation → optional `SemanticChunker` on oversized prose → greedy token-budget packing (`_pack_segments`) → force-split (`_force_split_oversized`) for anything exceeding Gemini's ~2048-token embed limit. Produces `Document` objects with full metadata (`header_path`, `block_types`, `chunk_hash`, `forced_split`, etc). | Tuning chunk size/target, changing what counts as "oversized," or the packing strategy. |
 | `embeddings.py` | `CachedGeminiEmbeddings` — batches texts, retries with exponential backoff (`tenacity`), and caches every successful **batch** immediately (so a mid-run failure doesn't lose already-embedded work). `embed_query()` reuses the same cached path. | Changing batch size behavior, retry policy, or the embedding provider. |
 | `cache.py` | SQLite-backed: `EmbeddingCache` (keyed on `content_hash + model + task_type` — task_type matters, see Incident Playbook below), `FileStateStore` (per-file SHA256 for incremental re-runs), `IngestedChunkStore` (durable ledger of which chunk hashes have been written to the vector store — this is what makes resume-after-interruption work). | Changing what gets cached/tracked, or the SQLite schema. |
-| `vectorstore.py` | `VectorStore` — thin wrapper over `chromadb`'s `PersistentClient`, used directly (not via `langchain-chroma`) so pre-computed embeddings upsert without recomputation. Creates collections with **cosine** distance (not Chroma's L2 default). `existing_ids()` / `upsert()` / `query()` / `count()`. | Changing the vector DB backend, distance metric, or query behavior. |
+| `vectorstore.py` | `VectorStore` — thin wrapper over a hosted **Pinecone** index (see the chromadb incident below for why it's not local anymore). Creates the index with cosine metric if it doesn't exist. Chunk content also rides along in Pinecone metadata under `"content"` (Pinecone has nowhere else to put it), unpacked back out in `query()`. Converts Pinecone's similarity score to a `1 - score` "distance" so the rest of the app doesn't care which vector store is behind it. `existing_ids()` / `upsert()` / `query()` / `count()`. | Changing the vector DB backend or query behavior. |
 | `models.py` | `IngestionStats` — per-file result summary (chunks ingested/duplicate/skipped, errors). | Adding a new stat to track/report. |
 | `pipeline.py` | `IngestionPipeline.ingest_file()` — orchestrates one file end-to-end: file-hash check → load → chunk → dedupe → filter-already-ingested → embed → upsert → mark completed. Writes failed batches to `logs/dead_letter/*.json` instead of losing progress. | Changing the overall ingestion flow/ordering. |
 | `cli.py` | `cricllm.cli.main()` — argparse entry point behind `run_ingestion.py`. Walks a file or directory of `.md` files and calls `ingest_file()` on each. | Adding a new CLI flag. |
@@ -109,7 +111,7 @@ request gets killed by `WORKER TIMEOUT`.
 | `test_markdown_structure.py` | Header hierarchy → metadata, no content leaking across sections. |
 | `test_semantic_chunker.py` | Code/curl/table blocks never split at normal sizes; oversized blocks get force-split with `forced_split=True`; chunk metadata (hash, header_path) present and unique. |
 | `test_embeddings.py` | Per-batch caching survives a later batch's failure (resume works); a retried call only re-embeds what's missing; cache doesn't leak between `RETRIEVAL_DOCUMENT` and `RETRIEVAL_QUERY` for identical text. |
-| `test_vectorstore.py` | New collections use cosine distance; reopening a pre-existing non-cosine collection logs a warning; query ranking actually respects cosine similarity. |
+| `test_vectorstore.py` | Index gets created (with cosine metric) if missing, not recreated if it already exists; upsert packs chunk content into Pinecone metadata; query unpacks it back out and converts similarity → distance; `existing_ids`/metadata sanitization behave correctly. All against a fake in-memory Pinecone client double, no real account needed. |
 
 Run everything:
 ```bash
@@ -182,7 +184,69 @@ Ingestion never completed successfully for that collection — check
 `logs/dead_letter/` for failed-batch records and `logs/cricllm.log` for the
 actual failure reason (usually one of the above).
 
-**Migrating to cosine distance on an existing index**
-Chroma can't change an existing collection's distance metric. Bump
-`CRICLLM_COLLECTION_NAME` to a new value and re-run ingestion — embeddings
-are cached in SQLite, so this re-upserts without any new Gemini API calls.
+**Deployed on Render free tier: repeated `WORKER TIMEOUT` / `SIGKILL`, no obvious slow request**
+Free tier gives ~0.1 CPU — under that much throttling, gunicorn's worker
+can fail to "check in" with its own master process in time even while
+sitting idle, since it never gets scheduled enough CPU to run its own
+heartbeat code, and gets killed as if it were unresponsive. Free tier also
+has no persistent disk and spins down after inactivity, which doesn't mix
+well with anything needing local state. If you're seeing timeouts with no
+correlated slow request in the logs, check the plan/tier before debugging
+the app further — this turned out to be a real, separate issue from the
+chromadb one below, not a symptom of it.
+
+**chromadb hangs indefinitely inside a live gunicorn worker (the reason we're on Pinecone now)**
+This was the big one. Deployed on Render, `/api/ask` would hang forever —
+no error, no timeout, no response — until gunicorn's own `--timeout`
+killed the worker (`WORKER TIMEOUT` / `SIGKILL`, "Perhaps out of memory?").
+That message is misleading boilerplate; here's what we actually ruled out,
+in order, with hard evidence each time:
+
+- **Not the vector store data** — a direct check from the same shell showed
+  the correct chunk count, matching local.
+- **Not the deployed code** — confirmed the live commit had the right
+  source (a stale `pip install -e git+...@<old commit>` in `requirements.txt`
+  was a real but separate bug — it shadows the repo's actual `src/` code
+  with a frozen old copy unless something explicitly puts `src/` first on
+  `sys.path`, which `app.py`/`scripts/*.py` do; remove that `-e git+...`
+  line if you ever see it, it should never be there).
+- **Not the API key** — a bounded `curl` straight to Gemini's REST endpoint,
+  and the full `QAEngine.answer_stream()` loop run directly in Python (not
+  through Flask), both completed in ~10s.
+- **Not gunicorn's worker class** — switching `sync` → `gthread` made zero
+  difference; the hang happened at the identical line either way, which
+  rules out anything signal-based (`sync`'s timeout mechanism).
+- **Not memory** — sampled the worker's `VmRSS` every 10s during the hang:
+  completely flat the whole time. A real leak/OOM climbs; this didn't move
+  at all. (Kernel OOM kills also show up in `/sys/fs/cgroup/memory.events`'s
+  `oom_kill` counter — worth checking directly if you ever suspect this
+  again, rather than trusting gunicorn's canned message.)
+- **Not a stale/reused connection** — a *brand-new* `VectorStore`,
+  constructed fresh inside the request, hung identically to the long-lived
+  one.
+- **Not Render's reverse proxy** — hitting `127.0.0.1:<port>` directly, from
+  inside the same container, hung exactly the same way.
+
+What was left: any chromadb call — construction or a plain `.count()` —
+worked fine once, at module import time when the worker first boots (that's
+the only reason `GET /` ever succeeded), but hung the instant it was called
+again from inside actual request-handling code, in every configuration
+tried. A raw `sqlite3` query against the identical `.chroma` file, from
+inside that same live request, was instant. So it wasn't SQLite, wasn't the
+file, wasn't our code — it was something specific to chromadb's own
+(Rust/PyO3-backed) client behaving differently once a gunicorn worker is
+actively serving versus still starting up. We didn't get further than that
+diagnosis (no `py-spy`/`sudo` available in the container to get an actual
+stack trace of the stuck frame) — instead of chasing it further, we moved
+the vector store off local chromadb entirely onto hosted Pinecone (a plain
+REST/HTTP client, no local persistent Rust core), which sidesteps the
+question rather than answering it.
+
+If you're ever debugging something that looks like this again — hangs only
+in a live server process, not standalone; not memory; not the obvious
+suspects — the technique that actually worked was **bisection via
+temporary debug routes**: add a route that does the minimal suspect
+operation directly (bypass every layer above it) and log/print at each
+step, redeploy, reproduce, read the logs. That's what actually narrowed
+this down through six ruled-out hypotheses without ever getting a real
+stack trace.

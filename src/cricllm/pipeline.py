@@ -56,7 +56,9 @@ class IngestionPipeline:
             retry_min_seconds=settings.retry_min_seconds,
             retry_max_seconds=settings.retry_max_seconds,
         )
-        self.vector_store = VectorStore(settings.persist_dir, settings.collection_name)
+        self.vector_store = VectorStore(
+            settings.pinecone_api_key, settings.pinecone_index_name, settings.embedding_dimension
+        )
 
     def ingest_file(self, path: Path, force: bool = False) -> IngestionStats:
         """Run one file through the whole pipeline. Always returns stats, even on failure."""

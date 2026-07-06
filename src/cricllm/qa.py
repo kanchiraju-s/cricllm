@@ -174,7 +174,9 @@ class QAEngine:
             cache=cache,
             show_progress=False,
         )
-        self._store = VectorStore(settings.persist_dir, settings.collection_name)
+        self._store = VectorStore(
+            settings.pinecone_api_key, settings.pinecone_index_name, settings.embedding_dimension
+        )
         self._client = genai.Client(api_key=settings.google_api_key)
 
     def is_ready(self) -> bool:

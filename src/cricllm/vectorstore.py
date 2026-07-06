@@ -1,81 +1,75 @@
-"""Our Chroma vector store, wrapped up so re-running ingestion is always safe.
+"""Our Pinecone-backed vector store.
 
-We talk to `chromadb` directly instead of going through `langchain_chroma`.
-The convenience wrapper would recompute embeddings for us on every insert,
-which defeats the whole point of caching them ourselves.
+We used to run this locally on `chromadb`, but its Python client
+reproducibly hung the moment it was called from inside a live gunicorn
+worker on Render — confirmed through extensive isolation testing to be
+neither our code, the data, the API key, nor memory pressure, but something
+specific to chromadb's own (Rust-backed) client running in that particular
+process context. Pinecone's client is a plain REST/HTTP SDK with no local
+persistent Rust core, which sidesteps that entirely — and as a bonus, it
+also means the rulebook's actual text no longer needs to live on our own
+disk (or in git) at all, since Pinecone hosts it.
 
-We also use each chunk's content hash as its Chroma document ID. That's the
-whole trick behind duplicate detection: re-inserting the same chunk just
-overwrites the same row instead of creating a copy.
+Chunk content hashes are used as vector IDs, same trick as before: re-upserting
+an unchanged chunk overwrites the same row instead of creating a duplicate.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import chromadb
-from chromadb.config import Settings as ChromaSettings
 from langchain_core.documents import Document
+from pinecone import Pinecone, ServerlessSpec
 
 from cricllm.logging_config import get_logger
 
 logger = get_logger("vectorstore")
 
 _UPSERT_BATCH_SIZE = 100
+_FETCH_BATCH_SIZE = 200
 
 
 class VectorStore:
-    """Thin wrapper around one persistent Chroma collection."""
+    """Thin wrapper around one Pinecone index."""
 
-    def __init__(self, persist_dir: Path, collection_name: str) -> None:
-        self._client = chromadb.PersistentClient(
-            path=str(persist_dir), settings=ChromaSettings(anonymized_telemetry=False)
-        )
-        # Chroma defaults to L2 distance, but Gemini's embeddings aren't
-        # guaranteed to be unit-length, so L2 can rank things differently
-        # than actual semantic similarity would. Cosine is the right call
-        # here. Only bites for a brand new collection though — Chroma won't
-        # let you change the distance metric on one that already exists.
-        self._collection = self._client.get_or_create_collection(
-            name=collection_name, metadata={"hnsw:space": "cosine"}
-        )
-        current_space = (self._collection.metadata or {}).get("hnsw:space", "l2")
-        if current_space != "cosine":
-            logger.warning(
-                "Collection '%s' was created with '%s' distance, not 'cosine' — Chroma can't "
-                "change this on an existing collection. To pick up cosine distance, set "
-                "CRICLLM_COLLECTION_NAME to a new name and re-run ingestion; cached embeddings "
-                "mean this re-upserts without any new API calls.",
-                collection_name,
-                current_space,
+    def __init__(self, api_key: str, index_name: str, dimension: int) -> None:
+        self._client = Pinecone(api_key=api_key)
+        if not self._client.has_index(index_name):
+            logger.info("Creating Pinecone index %r (dimension=%d, metric=cosine)", index_name, dimension)
+            self._client.create_index(
+                name=index_name,
+                dimension=dimension,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
             )
+        self._index = self._client.Index(index_name)
 
     def existing_ids(self, ids: list[str]) -> set[str]:
-        """Which of these ids are already sitting in the collection?"""
+        """Which of these ids are already sitting in the index?"""
         if not ids:
             return set()
         found: set[str] = set()
-        for i in range(0, len(ids), _UPSERT_BATCH_SIZE):
-            batch = ids[i : i + _UPSERT_BATCH_SIZE]
-            result = self._collection.get(ids=batch, include=[])
-            found.update(result["ids"])
+        for i in range(0, len(ids), _FETCH_BATCH_SIZE):
+            batch = ids[i : i + _FETCH_BATCH_SIZE]
+            result = self._index.fetch(ids=batch)
+            found.update(result.vectors.keys())
         return found
 
     def upsert(self, documents: list[Document], ids: list[str], embeddings: list[list[float]]) -> None:
-        """Write documents + their already-computed embeddings into Chroma, in batches."""
+        """Write documents + their already-computed embeddings into Pinecone, in batches."""
         if not documents:
             return
-        for i in range(0, len(documents), _UPSERT_BATCH_SIZE):
-            batch_docs = documents[i : i + _UPSERT_BATCH_SIZE]
-            batch_ids = ids[i : i + _UPSERT_BATCH_SIZE]
-            batch_embeddings = embeddings[i : i + _UPSERT_BATCH_SIZE]
-            self._collection.upsert(
-                ids=batch_ids,
-                embeddings=batch_embeddings,  # type: ignore[arg-type]  # chromadb accepts plain list[list[float]] at runtime
-                documents=[doc.page_content for doc in batch_docs],
-                metadatas=[_sanitize_metadata(doc.metadata) for doc in batch_docs],
-            )
-        logger.info("Upserted %d chunks into collection", len(documents))
+        vectors = [
+            {
+                "id": doc_id,
+                "values": vector,
+                # Pinecone has nowhere else to put the chunk text, so it
+                # rides along in metadata under "content" and gets pulled
+                # back out in query().
+                "metadata": _sanitize_metadata({**doc.metadata, "content": doc.page_content}),
+            }
+            for doc_id, doc, vector in zip(ids, documents, embeddings)
+        ]
+        self._index.upsert(vectors=vectors, batch_size=_UPSERT_BATCH_SIZE, show_progress=False)
+        logger.info("Upserted %d chunks into Pinecone index", len(documents))
 
     def query(self, query_embedding: list[float], n_results: int = 5) -> list[dict]:
         """Find the ``n_results`` chunks closest to this query embedding.
@@ -83,35 +77,35 @@ class VectorStore:
         Each result has ``id``, ``content``, ``metadata``, and ``distance``
         — the smaller the distance, the closer the match.
         """
-        result = self._collection.query(
-            query_embeddings=[query_embedding],  # type: ignore[arg-type]  # chromadb accepts plain list[list[float]] at runtime
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"],
-        )
-        # mypy thinks these could be None because the type stub covers the
-        # case where you didn't ask for them via `include` — we did, so
-        # they're always there.
-        ids = result["ids"][0]
-        documents = result["documents"][0]  # type: ignore[index]
-        metadatas = result["metadatas"][0]  # type: ignore[index]
-        distances = result["distances"][0]  # type: ignore[index]
-        return [
-            {"id": doc_id, "content": content, "metadata": metadata, "distance": distance}
-            for doc_id, content, metadata, distance in zip(ids, documents, metadatas, distances)
-        ]
+        result = self._index.query(vector=query_embedding, top_k=n_results, include_metadata=True)
+        matches = []
+        for match in result.matches:
+            metadata = dict(match.metadata or {})
+            content = metadata.pop("content", "")
+            # Pinecone hands back a cosine SIMILARITY (higher = closer);
+            # everything downstream expects a "distance" (lower = closer),
+            # same convention Chroma used, so the rest of the app doesn't
+            # need to know or care which vector store is behind it.
+            distance = 1 - match.score
+            matches.append(
+                {"id": match.id, "content": content, "metadata": metadata, "distance": distance}
+            )
+        return matches
 
     def count(self) -> int:
-        return self._collection.count()
+        return self._index.describe_index_stats().total_vector_count
 
 
 def _sanitize_metadata(metadata: dict) -> dict:
-    """Chroma only accepts str/int/float/bool in metadata, so flatten anything fancier."""
+    """Pinecone metadata is str/int/float/bool/list[str] — no None, nothing fancier."""
     sanitized: dict = {}
     for key, value in metadata.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
             sanitized[key] = value
-        elif isinstance(value, list):
-            sanitized[key] = ",".join(str(v) for v in value)
+        elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+            sanitized[key] = value
         else:
             sanitized[key] = str(value)
     return sanitized
