@@ -60,6 +60,28 @@ def index() -> str:
     return render_template("index.html")
 
 
+@app.get("/api/debug/rawsql")
+def debug_rawsql() -> Response:
+    """TEMPORARY — bisects whether the /api/ask hang is chromadb-specific or
+    any SQLite access from inside a live request. Bypasses chromadb's
+    Python wrapper entirely and queries the same .chroma file directly.
+    Remove once the hang is diagnosed.
+    """
+    import sqlite3
+    import time
+
+    logger.info(">>> /api/debug/rawsql: connecting directly with sqlite3 module")
+    start = time.monotonic()
+    conn = sqlite3.connect(str(_settings.persist_dir / "chroma.sqlite3"), timeout=5)
+    logger.info(">>> /api/debug/rawsql: connected in %.2fs, querying...", time.monotonic() - start)
+    # Same query the `sqlite3` CLI ran successfully by hand — deliberately
+    # not guessing chromadb's internal table names here.
+    count = conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
+    conn.close()
+    logger.info(">>> /api/debug/rawsql: got count=%d in %.2fs total", count, time.monotonic() - start)
+    return jsonify({"count": count})
+
+
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
