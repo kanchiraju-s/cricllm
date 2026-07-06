@@ -66,14 +66,22 @@ def _sse(payload: dict) -> str:
 
 @app.post("/api/ask")
 def ask():
+    # TEMPORARY diagnostic logging — tracing exactly where a request that
+    # hangs on Render actually stops, since py-spy/sudo aren't available in
+    # that container. Safe to strip back out once the hang is found.
+    logger.info(">>> /api/ask: request received")
     payload = request.get_json(silent=True) or {}
     question = (payload.get("question") or "").strip()
     top_k = payload.get("top_k")
+    logger.info(">>> /api/ask: parsed question=%r top_k=%r", question, top_k)
 
     if not question:
         return jsonify({"error": "Question must not be empty."}), 400
 
-    if not _engine.is_ready():
+    ready = _engine.is_ready()
+    logger.info(">>> /api/ask: is_ready() = %s", ready)
+
+    if not ready:
         return jsonify(
             {
                 "error": (
@@ -84,21 +92,27 @@ def ask():
         ), 503
 
     def stream():
+        logger.info(">>> stream(): generator started")
         try:
             for event in _engine.answer_stream(question, top_k=top_k):
+                logger.info(">>> stream(): got event kind=%s", event.kind)
                 if event.kind == "sources":
                     sources = [
                         {"header_path": s.header_path, "distance": s.distance}
                         for s in event.sources
                     ]
                     yield _sse({"type": "sources", "sources": sources})
+                    logger.info(">>> stream(): yielded sources event")
                 elif event.kind == "delta":
                     yield _sse({"type": "answer", "answer_html": render_answer_html(event.text)})
+                    logger.info(">>> stream(): yielded answer delta, len=%d", len(event.text))
             yield _sse({"type": "done"})
+            logger.info(">>> stream(): yielded done, generator finished")
         except CricLLMError as exc:
-            logger.error("Failed to answer %r: %s", question, exc)
+            logger.error(">>> stream(): failed to answer %r: %s", question, exc)
             yield _sse({"type": "error", "error": str(exc)})
 
+    logger.info(">>> /api/ask: returning streaming Response")
     return Response(
         stream(),
         mimetype="text/event-stream",
