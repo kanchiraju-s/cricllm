@@ -82,6 +82,25 @@ def debug_rawsql() -> Response:
     return jsonify({"count": count})
 
 
+@app.get("/api/debug/freshvectorstore")
+def debug_fresh_vectorstore() -> Response:
+    """TEMPORARY — is it the long-lived, reused `_engine` connection that's
+    broken, or does even a brand-new VectorStore hang once called from
+    inside a live request? Remove once the hang is diagnosed.
+    """
+    import time
+
+    from cricllm.vectorstore import VectorStore
+
+    logger.info(">>> /api/debug/freshvectorstore: constructing a brand-new VectorStore")
+    start = time.monotonic()
+    store = VectorStore(_settings.persist_dir, _settings.collection_name)
+    logger.info(">>> /api/debug/freshvectorstore: constructed in %.2fs, calling count()...", time.monotonic() - start)
+    count = store.count()
+    logger.info(">>> /api/debug/freshvectorstore: got count=%d in %.2fs total", count, time.monotonic() - start)
+    return jsonify({"count": count})
+
+
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
